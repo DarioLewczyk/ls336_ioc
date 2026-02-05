@@ -1,0 +1,2 @@
+[console_scripts]
+ls336-ioc = ls336_ioc.application:main

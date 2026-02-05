@@ -1,0 +1,10 @@
+Metadata-Version: 2.4
+Name: ls336-ioc
+Version: 0.1.0
+Summary: EPICS IOC for Lakeshore 336 with Celsius support
+Author: Your Name
+License-File: LICENSE
+Requires-Dist: caproto
+Requires-Dist: pyvisa
+Requires-Dist: emmi
+Dynamic: license-file
