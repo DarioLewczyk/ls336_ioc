@@ -29,6 +29,8 @@ class LakeShoreIoc(PVGroup):
     SETP3_RBV = pvproperty(value=0.0, dtype=float, doc="Output 3 setpoint readback (°C)")
 
     RAMP3 = pvproperty(value=0.0, dtype=float, doc="Output 3 ramp rate (°C/min)")
+    RAMP3_ON = pvproperty(value = 0, dtype=int, doc = "Ramp enable for output 3 (0 =off, 1 = on)")
+    RAMP3_ON_RBV = pvproperty(value = 0, dtype=int, doc = "Readback value for the ramp (0 =off, 1 = on)")
     RAMP3_RBV = pvproperty(value=0.0, dtype=float, doc="Output 3 ramp rate readback (°C/min)")
 
     RANGE3 = pvproperty(value=0, dtype=int, doc="Output 3 heater range (0=Off,1=On)")
@@ -39,6 +41,9 @@ class LakeShoreIoc(PVGroup):
     D3 = pvproperty(value=0.0, dtype=float, doc="Output 3 PID D")
 
     HEATER3_OUT = pvproperty(value=0.0, dtype=float, doc="Output 3 heater output (%)")
+
+    ATUNE3 = pvproperty(value = 0, dtype=int, doc="Start autotune for loop 3 (write 1 to start)")
+    ATUNE3_RBV = pvproperty(value= 0, dtype=int, doc = "Autotune status for loop 3")
 
     # keep your existing cryo/heater PVs etc. as needed...
 
@@ -124,6 +129,12 @@ class LakeShoreIoc(PVGroup):
         # enable ramp, set rate
         await self.ls336_write(f"RAMP 3,1,{float(val)}")
 
+    @RAMP3_ON.putter
+    async def RAMP3_ON(self, inst, val):
+        ramp_on_str, rate_str = (await self.ls336_query("RAMP? 3")).split(",")
+        rate = float(rate_str)
+        await self.ls336_write(f"RAMP 3,{int(val)},{rate}")
+
     @RANGE3.putter
     async def RANGE3(self, inst, val):
         await self.ls336_write(f"RANGE 3,{int(val)}")
@@ -145,24 +156,49 @@ class LakeShoreIoc(PVGroup):
         P, I, _ = (await self.ls336_query("PID? 3")).split(",")
         await self.ls336_write(f"PID 3,{float(P)},{float(I)},{float(val)}")
 
+    @ATUNE3.putter
+    async def ATUNE3(self, inst, val):
+        if int(val) == 1:
+            await self.ls336_write("ATUNE 3")
+
     @main_state.scan(period=1.0)
     async def _update(self, inst, async_lib):
-        status = await self.status_query()
-
-        # Temps (C)
-        await self.TEMP_C.write(float(status["CRDGC"]))
-        await self.TEMP_D.write(float(status["CRDGD"]))
-
-        # Output 3 setpoint, ramp, range, PID, heater
-        await self.SETP3_RBV.write(float(status["SETP3"]))
-        ramp_on, ramp_rate = status["RAMP3"].split(",")
+        # --- Fast-changing values ---
+        temp_c = float(await self.ls336_query("CRDG? C"))
+        temp_d = float(await self.ls336_query("CRDG? D"))
+        setp3 = float(await self.ls336_query("SETP? 3")) 
+        ramp3 = await self.ls336_query("RAMP? 3")
+        htr3 = float(await self.ls336_query("HTR? 3"))
+    
+        await self.TEMP_C.write(temp_c)
+        await self.TEMP_D.write(temp_d)
+        await self.SETP3_RBV.write(setp3)
+    
+        ramp_on, ramp_rate = ramp3.split(",") 
         await self.RAMP3_RBV.write(float(ramp_rate))
-        await self.RANGE3_RBV.write(int(status["RANGE3"]))
+        await self.RAMP3_ON_RBV.write(int(ramp_on))
+    
+        await self.HEATER3_OUT.write(htr3)
+    
+        # --- Slow-changing values (every 10 seconds) ---
+        now = time.time()
+        if not hasattr(self, "_last_slow_update"):
+            self._last_slow_update = 0
+    
+        if now - self._last_slow_update > 10:
+            # Autotune safety: 
+            raw = (await self.ls336_query("ATUNE? 3")).strip()
+            atune_status = int(raw) if raw else 0
 
-        P, I, D = status["PID3"].split(",")
-        await self.P3.write(float(P))
-        await self.I3.write(float(I))
-        await self.D3.write(float(D))
-
-        await self.HEATER3_OUT.write(float(status["HTR3"]))
-
+            range3 = int(await self.ls336_query("RANGE? 3"))
+            pid3 = await self.ls336_query("PID? 3")
+            P, I, D = map(float, pid3.split(","))
+    
+            await self.RANGE3_RBV.write(range3)
+            await self.ATUNE3_RBV.write(atune_status)
+            await self.P3.write(P)
+            await self.I3.write(I)
+            await self.D3.write(D)
+    
+            self._last_slow_update = now
+    
