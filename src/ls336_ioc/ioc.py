@@ -1,4 +1,4 @@
-#  Authorship: {{{ 
+#  Authorship: {{{           
 """  
 Written by: Dario C. Lewczyk
 Based on ls336-ioc maintained by: fboariu
@@ -17,7 +17,7 @@ import ls336_ioc.flags as fflg
 logger = logging.getLogger(__name__)
 
 
-class LakeShoreIoc(PVGroup):
+class LakeShoreIoc(PVGroup): 
     main_state = pvproperty(value=False)
 
     # --- Temperatures (Celsius) ---
@@ -40,16 +40,47 @@ class LakeShoreIoc(PVGroup):
     I3 = pvproperty(value=25.0, dtype=float, doc="Output 3 PID I")
     D3 = pvproperty(value=0.0, dtype=float, doc="Output 3 PID D")
 
-    HEATER3_OUT = pvproperty(value=0.0, dtype=float, doc="Output 3 heater output (%)")
+    HEATER3_OUT = pvproperty(value=0.0, dtype=float, doc="Output 3 heater output (%)") # RB Val for heater
+    MANUAL3_OUT = pvproperty(value=0.0, dtype=float, doc="Manual output percentage for a heater")
+    MANUAL3_OUT_RBV = pvproperty(value=0.0, dtype=float)
 
-    ATUNE3 = pvproperty(value = 0, dtype=int, doc="Start autotune for loop 3 (write 1 to start)")
+    OUTMODE3 = pvproperty(
+            value=1, dtype=int, 
+            doc="Output 3 Mode switch: (0=OFF, 1 = PID, 2=Zone, 3=OpenLoop)"
+    )
+    OUTMODE3_RBV = pvproperty(value=1, dtype=int)
+
+    ATUNE3 = pvproperty(value = 0, dtype=int, doc="Start autotune for loop 3 (0: P only, 1: PI, 2: PID)")
     ATUNE3_RBV = pvproperty(value= 0, dtype=int, doc = "Autotune status for loop 3")
+
+    ATUNE3_TERM = pvproperty(value=0, dtype=int)
+    """ 
+    Returned <tuning status>,<output>,<error status>,<stage status>[term]
+    Format n,n,n,nn
+    <tuning status> <output> Remarks 0 = no active tuning, 1 = active tuning.
+        Heater output of the control loop being tuned (if tuning):
+        1 = output 1, 2 = output 2
+    <error status> <stage status> 0 = no tuning error, 1 = tuning error
+        Specifies the current stage in the Autotune process.
+    If tuning error occurred, stage status represents stage
+    that failed.
+    If initial conditions are not met when starting the autotune 
+    """
+    TUNEST3_OUTPUT = pvproperty(value=0, dtype=int)
+
+    TUNEST3_RBV = pvproperty(value=0, dtype=int) # EXPOSES Autotuning errors
+    TUNEST3_STATUS = pvproperty(value=0, dtype=int)
+    TUNEST3_STAGE = pvproperty(value=0, dtype=int)
+    TUNEST3_ERROR = pvproperty(value=0, dtype=int)
+
+
 
     # keep your existing cryo/heater PVs etc. as needed...
 
     def __init__(self, prefix, dev=None, rman=None, motors=None):
         self.ls336 = self._init_device(dev, rman)
         self.prefix = prefix
+        self._last_atune_mode = 2 # Defaults to PID
         super().__init__(prefix)
 
     def _init_device(self, dev=None, rman=None):
@@ -155,11 +186,41 @@ class LakeShoreIoc(PVGroup):
     async def D3(self, inst, val):
         P, I, _ = (await self.ls336_query("PID? 3")).split(",")
         await self.ls336_write(f"PID 3,{float(P)},{float(I)},{float(val)}")
+    @MANUAL3_OUT.putter
+    async def MANUAL3_OUT(self, inst, val):
+        pct = float(val)
+        if pct <0 or pct > 100:
+            raise ValueError("Manual output must be between 0 and 100")
+        await self.ls336_write(f'MOUT 3,{pct}')
+
+    @OUTMODE3.putter
+    async def OUTMODE3(self, inst, val):
+        mode = int(val)
+        if mode not in (0, 1, 3):
+            raise ValueError("OUTMODE3 must be 0 (OFF), 1 (PID), or 3 (OpenLoop)")
+        # Keep input = 3 and powerup = 0 (default)
+        await self.ls336_write(f'OUTMODE 3,{mode},3,0')
 
     @ATUNE3.putter
     async def ATUNE3(self, inst, val):
+        mode = int(val)
+        if mode in (0, 1, 2):
+            # Store the mode so termination uses the same
+            self._last_atune_mode = mode
+            # Val is the mode
+            await self.ls336_write(f"ATUNE 3,{mode}")
+    @ATUNE3_TERM.putter
+    async def ATUNE3_TERM(self, inst, val):
         if int(val) == 1:
-            await self.ls336_write("ATUNE 3")
+            # First read active mode from ATUNE? 3
+            raw = await self.ls336_query("ATUNE? 3")
+            try:
+                active_mode = int(raw.strip())
+            except:
+                active_mode = self._last_atune_mode
+            # Terminate autotune and clear screen
+            await self.ls336_write(f"ATUNE 3,{active_mode},0")  # or use last mode dynamically
+            await self.ATUNE3_TERM.write(0)
 
     @main_state.scan(period=1.0)
     async def _update(self, inst, async_lib):
@@ -193,12 +254,33 @@ class LakeShoreIoc(PVGroup):
             range3 = int(await self.ls336_query("RANGE? 3"))
             pid3 = await self.ls336_query("PID? 3")
             P, I, D = map(float, pid3.split(","))
-    
+
+
+            outmode = await self.ls336_query("OUTMODE? 3")
+            mode, inp, pwr = map(int, outmode.split(','))
+            mout = float(await self.ls336_query("MOUT? 3"))
+
+            tunest_raw = await self.ls336_query("TUNEST? 3")
+            status_str, output_str, error_str, stage_str = tunest_raw.split(",")
+
+            status = int(status_str)
+            output = int(output_str)
+            error = int(error_str)
+            stage = int(stage_str)
+          
             await self.RANGE3_RBV.write(range3)
             await self.ATUNE3_RBV.write(atune_status)
             await self.P3.write(P)
             await self.I3.write(I)
             await self.D3.write(D)
+            await self.OUTMODE3_RBV.write(mode)
+            await self.MANUAL3_OUT_RBV.write(mout)
+
+            # You can expose all four, or just the status 
+            await self.TUNEST3_STATUS.write(status)
+            await self.TUNEST3_OUTPUT.write(output)
+            await self.TUNEST3_ERROR.write(error)
+            await self.TUNEST3_STAGE.write(stage)
     
             self._last_slow_update = now
     
